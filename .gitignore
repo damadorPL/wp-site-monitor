@@ -1,0 +1,15 @@
+# Secrets — never commit these
+indexing-script/config.json
+indexing-script/*.json
+!indexing-script/config.example.json
+
+# Logs
+indexing-script/push_indexing.log
+indexing-script/push_indexing_log.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/

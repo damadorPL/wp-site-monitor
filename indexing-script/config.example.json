@@ -1,0 +1,7 @@
+{
+    "wp_base_url": "https://your-site.com",
+    "wpsm_secret_key": "paste-your-secret-key-from-plugin-settings",
+    "google_service_account_file": "your-service-account-key.json",
+    "max_urls_per_cycle": 200,
+    "cycle_interval_hours": 25
+}
