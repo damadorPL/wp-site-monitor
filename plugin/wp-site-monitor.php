@@ -14,15 +14,26 @@ if (!defined('ABSPATH')) exit;
 
 define('WPSM_VERSION', '2.0');
 define('WPSM_SLUG', 'wp-site-monitor');
+define('WPSM_SECRET_OPTION', 'wpsm_api_secret_key');
+define('WPSM_SECRET_HASH_OPTION', 'wpsm_api_secret_key_hash');
+define('WPSM_SECRET_LEGACY_OPTION', 'wpsm_api_secret_key_legacy');
+define('WPSM_CLEANUP_HOOK', 'wpsm_cleanup_logs');
 
 // ============================================================
 // SETTINGS PAGE
 // ============================================================
 
 add_action('admin_init', function() {
-    register_setting('wpsm_settings', 'wpsm_api_secret_key', array(
+    $legacy_secret = get_option(WPSM_SECRET_OPTION, null);
+    if (is_string($legacy_secret) && $legacy_secret !== '') {
+        update_option(WPSM_SECRET_LEGACY_OPTION, $legacy_secret, false);
+        update_option(WPSM_SECRET_HASH_OPTION, wp_hash_password($legacy_secret), false);
+        update_option(WPSM_SECRET_OPTION, '', false);
+    }
+
+    register_setting('wpsm_settings', WPSM_SECRET_OPTION, array(
         'type' => 'string',
-        'sanitize_callback' => 'sanitize_text_field',
+        'sanitize_callback' => 'wpsm_sanitize_api_secret_key',
         'default' => '',
     ));
     register_setting('wpsm_settings', 'wpsm_bot_log_limit', array(
@@ -42,21 +53,141 @@ add_action('admin_init', function() {
     ));
 });
 
-function wpsm_get_secret_key() {
-    return get_option('wpsm_api_secret_key', '');
+function wpsm_sanitize_api_secret_key($value) {
+    $value = is_string($value) ? trim(wp_unslash($value)) : '';
+
+    if ($value === '') {
+        delete_option(WPSM_SECRET_HASH_OPTION);
+        delete_option(WPSM_SECRET_LEGACY_OPTION);
+        return '';
+    }
+
+    update_option(WPSM_SECRET_HASH_OPTION, wp_hash_password($value), false);
+
+    if (get_option(WPSM_SECRET_LEGACY_OPTION, '') !== '') {
+        update_option(WPSM_SECRET_LEGACY_OPTION, $value, false);
+    }
+
+    return '';
+}
+
+function wpsm_get_secret_key_hash() {
+    return (string) get_option(WPSM_SECRET_HASH_OPTION, '');
+}
+
+function wpsm_get_legacy_secret_key() {
+    return (string) get_option(WPSM_SECRET_LEGACY_OPTION, '');
+}
+
+function wpsm_verify_secret_key($provided_key) {
+    $provided_key = is_string($provided_key) ? trim($provided_key) : '';
+    if ($provided_key === '') {
+        return false;
+    }
+
+    $hash = wpsm_get_secret_key_hash();
+    if ($hash !== '' && wp_check_password($provided_key, $hash)) {
+        return true;
+    }
+
+    $legacy = wpsm_get_legacy_secret_key();
+    return $legacy !== '' && hash_equals($legacy, $provided_key);
+}
+
+function wpsm_get_request_header($key) {
+    $server_key = 'HTTP_' . strtoupper(str_replace('-', '_', $key));
+    if (isset($_SERVER[$server_key])) {
+        return sanitize_text_field(wp_unslash($_SERVER[$server_key]));
+    }
+
+    return '';
+}
+
+function wpsm_get_request_timestamp($modifier) {
+    return gmdate('Y-m-d H:i:s', strtotime($modifier, current_time('timestamp', true)));
+}
+
+function wpsm_validate_month($value) {
+    $value = is_string($value) ? trim($value) : '';
+
+    if (!preg_match('/^\d{4}-\d{2}$/', $value)) {
+        return gmdate('Y-m', current_time('timestamp', true));
+    }
+
+    list($year, $month) = array_map('intval', explode('-', $value));
+    if ($month < 1 || $month > 12) {
+        return gmdate('Y-m', current_time('timestamp', true));
+    }
+
+    return sprintf('%04d-%02d', $year, $month);
+}
+
+function wpsm_schedule_cleanup() {
+    if (!wp_next_scheduled(WPSM_CLEANUP_HOOK)) {
+        wp_schedule_event(time() + HOUR_IN_SECONDS, 'hourly', WPSM_CLEANUP_HOOK);
+    }
+}
+
+function wpsm_unschedule_cleanup() {
+    $timestamp = wp_next_scheduled(WPSM_CLEANUP_HOOK);
+    if ($timestamp) {
+        wp_unschedule_event($timestamp, WPSM_CLEANUP_HOOK);
+    }
+}
+
+function wpsm_trim_table_by_limit($table_name, $limit, $threshold_multiplier) {
+    global $wpdb;
+
+    $limit = max(1, absint($limit));
+    $threshold = (int) ceil($limit * $threshold_multiplier);
+    $table = $wpdb->prefix . $table_name;
+    $count = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$table}");
+
+    if ($count <= $threshold) {
+        return;
+    }
+
+    $cutoff_id = $wpdb->get_var($wpdb->prepare(
+        "SELECT id FROM {$table} ORDER BY id DESC LIMIT 1 OFFSET %d",
+        $limit
+    ));
+
+    if ($cutoff_id) {
+        $wpdb->query($wpdb->prepare("DELETE FROM {$table} WHERE id < %d", $cutoff_id));
+    }
+}
+
+function wpsm_run_cleanup() {
+    wpsm_trim_table_by_limit('wpsm_bot_log', (int) get_option('wpsm_bot_log_limit', 10000), 1.2);
+    wpsm_trim_table_by_limit('wpsm_error_log', (int) get_option('wpsm_error_log_limit', 5000), 1.2);
+    wpsm_trim_table_by_limit('wpsm_indexing_log', (int) get_option('wpsm_indexing_log_limit', 50000), 1.1);
 }
 
 // ============================================================
 // DATABASE TABLES
 // ============================================================
 
-register_activation_hook(__FILE__, 'wpsm_create_tables');
+register_activation_hook(__FILE__, 'wpsm_activate');
+register_deactivation_hook(__FILE__, 'wpsm_deactivate');
+add_action(WPSM_CLEANUP_HOOK, 'wpsm_run_cleanup');
+
+function wpsm_activate() {
+    wpsm_create_tables();
+    wpsm_schedule_cleanup();
+}
+
+function wpsm_deactivate() {
+    wpsm_unschedule_cleanup();
+}
 
 function wpsm_create_tables() {
     global $wpdb;
     $charset = $wpdb->get_charset_collate();
+    $prefix = $wpdb->prefix;
 
-    $wpdb->query("CREATE TABLE IF NOT EXISTS {$wpdb->prefix}wpsm_bot_log (
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+
+    dbDelta("CREATE TABLE {$prefix}wpsm_bot_log (
         id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         visit_time DATETIME NOT NULL,
         bot VARCHAR(50) NOT NULL,
@@ -71,7 +202,7 @@ function wpsm_create_tables() {
         INDEX idx_url (url(191))
     ) $charset");
 
-    $wpdb->query("CREATE TABLE IF NOT EXISTS {$wpdb->prefix}wpsm_error_log (
+    dbDelta("CREATE TABLE {$prefix}wpsm_error_log (
         id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         error_time DATETIME NOT NULL,
         url VARCHAR(500) NOT NULL,
@@ -85,7 +216,7 @@ function wpsm_create_tables() {
         INDEX idx_status (status_code)
     ) $charset");
 
-    $wpdb->query("CREATE TABLE IF NOT EXISTS {$wpdb->prefix}wpsm_post_stats (
+    dbDelta("CREATE TABLE {$prefix}wpsm_post_stats (
         post_id BIGINT UNSIGNED NOT NULL,
         bot VARCHAR(50) NOT NULL,
         visit_count INT UNSIGNED DEFAULT 0,
@@ -95,7 +226,7 @@ function wpsm_create_tables() {
         INDEX idx_last (last_visit)
     ) $charset");
 
-    $wpdb->query("CREATE TABLE IF NOT EXISTS {$wpdb->prefix}wpsm_health (
+    dbDelta("CREATE TABLE {$prefix}wpsm_health (
         id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         check_time DATETIME NOT NULL,
         report LONGTEXT,
@@ -103,7 +234,7 @@ function wpsm_create_tables() {
         INDEX idx_time (check_time)
     ) $charset");
 
-    $wpdb->query("CREATE TABLE IF NOT EXISTS {$wpdb->prefix}wpsm_indexing_log (
+    dbDelta("CREATE TABLE {$prefix}wpsm_indexing_log (
         id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         push_time DATETIME NOT NULL,
         post_id BIGINT UNSIGNED NOT NULL,
@@ -131,12 +262,15 @@ register_uninstall_hook(__FILE__, 'wpsm_uninstall');
 
 function wpsm_uninstall() {
     global $wpdb;
+    wpsm_unschedule_cleanup();
     $tables = array('wpsm_bot_log', 'wpsm_error_log', 'wpsm_post_stats', 'wpsm_health', 'wpsm_indexing_log');
     foreach ($tables as $t) {
         $wpdb->query("DROP TABLE IF EXISTS {$wpdb->prefix}{$t}");
     }
     delete_option('wpsm_db_version');
-    delete_option('wpsm_api_secret_key');
+    delete_option(WPSM_SECRET_OPTION);
+    delete_option(WPSM_SECRET_HASH_OPTION);
+    delete_option(WPSM_SECRET_LEGACY_OPTION);
     delete_option('wpsm_bot_log_limit');
     delete_option('wpsm_error_log_limit');
     delete_option('wpsm_indexing_log_limit');
@@ -195,12 +329,12 @@ function wpsm_detect_bot($ua) {
 // ============================================================
 
 add_action('wp', function() {
-    $ua = isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : '';
+    $ua = isset($_SERVER['HTTP_USER_AGENT']) ? sanitize_text_field(wp_unslash($_SERVER['HTTP_USER_AGENT'])) : '';
     $bot = wpsm_detect_bot($ua);
     if (!$bot) return;
 
     global $wpdb;
-    $url = $_SERVER['REQUEST_URI'];
+    $url = isset($_SERVER['REQUEST_URI']) ? esc_url_raw(wp_unslash($_SERVER['REQUEST_URI'])) : '';
     $post_id = 0;
 
     if (is_singular()) {
@@ -212,8 +346,8 @@ add_action('wp', function() {
         'bot' => $bot,
         'url' => substr($url, 0, 500),
         'post_id' => $post_id,
-        'status_code' => http_response_code(),
-        'ip' => isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '',
+        'status_code' => is_404() ? 404 : 200,
+        'ip' => isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'])) : '',
         'ua' => substr($ua, 0, 500),
     ));
 
@@ -239,18 +373,6 @@ add_action('wp', function() {
         }
     }
 
-    // Cleanup old entries
-    $limit = (int) get_option('wpsm_bot_log_limit', 10000);
-    $threshold = (int) ($limit * 1.2);
-    $count = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}wpsm_bot_log");
-    if ($count > $threshold) {
-        $cutoff_id = $wpdb->get_var($wpdb->prepare(
-            "SELECT id FROM {$wpdb->prefix}wpsm_bot_log ORDER BY id DESC LIMIT 1 OFFSET %d", $limit
-        ));
-        if ($cutoff_id) {
-            $wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->prefix}wpsm_bot_log WHERE id < %d", $cutoff_id));
-        }
-    }
 }, 1);
 
 // Track 404 errors
@@ -258,31 +380,20 @@ add_action('template_redirect', function() {
     if (!is_404()) return;
 
     global $wpdb;
-    $ua = isset($_SERVER['HTTP_USER_AGENT']) ? substr($_SERVER['HTTP_USER_AGENT'], 0, 500) : '';
+    $ua = isset($_SERVER['HTTP_USER_AGENT']) ? substr(sanitize_text_field(wp_unslash($_SERVER['HTTP_USER_AGENT'])), 0, 500) : '';
     $bot = wpsm_detect_bot($ua);
+    $request_uri = isset($_SERVER['REQUEST_URI']) ? esc_url_raw(wp_unslash($_SERVER['REQUEST_URI'])) : '';
+    $referer = isset($_SERVER['HTTP_REFERER']) ? esc_url_raw(wp_unslash($_SERVER['HTTP_REFERER'])) : '';
 
     $wpdb->insert($wpdb->prefix . 'wpsm_error_log', array(
         'error_time' => current_time('mysql'),
-        'url' => substr($_SERVER['REQUEST_URI'], 0, 500),
+        'url' => substr($request_uri, 0, 500),
         'status_code' => 404,
-        'referer' => isset($_SERVER['HTTP_REFERER']) ? substr($_SERVER['HTTP_REFERER'], 0, 500) : '',
+        'referer' => substr($referer, 0, 500),
         'ua' => $ua,
         'is_bot' => $bot ? 1 : 0,
         'bot_name' => $bot ?: '',
     ));
-
-    // Cleanup
-    $limit = (int) get_option('wpsm_error_log_limit', 5000);
-    $threshold = (int) ($limit * 1.2);
-    $count = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}wpsm_error_log");
-    if ($count > $threshold) {
-        $cutoff_id = $wpdb->get_var($wpdb->prepare(
-            "SELECT id FROM {$wpdb->prefix}wpsm_error_log ORDER BY id DESC LIMIT 1 OFFSET %d", $limit
-        ));
-        if ($cutoff_id) {
-            $wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->prefix}wpsm_error_log WHERE id < %d", $cutoff_id));
-        }
-    }
 }, 999);
 
 // ============================================================
@@ -321,13 +432,14 @@ function wpsm_settings_page() {
                 <tr>
                     <th scope="row"><label for="wpsm_api_secret_key">REST API Secret Key</label></th>
                     <td>
-                        <input type="text" id="wpsm_api_secret_key" name="wpsm_api_secret_key"
-                               value="<?php echo esc_attr(get_option('wpsm_api_secret_key', '')); ?>"
+                        <input type="password" id="wpsm_api_secret_key" name="wpsm_api_secret_key"
+                               value=""
                                class="regular-text" autocomplete="off" />
                         <p class="description">
-                            Secret key for external REST API access (e.g. from the indexing script).<br>
-                            Leave empty to disable key-based access (admin-only access via cookies will still work).<br>
-                            <strong>Tip:</strong> Generate a random key, e.g.: <code><?php echo wp_generate_password(16, false); ?></code>
+                            Secret key for external REST API access sent in the <code>X-WPSM-Key</code> header.<br>
+                            Leave empty and save to disable key-based access (admin-only access via cookies will still work).<br>
+                            Stored as a hash; the current value cannot be displayed here.<br>
+                            <strong>Tip:</strong> Generate a random key, e.g.: <code><?php echo esc_html(wp_generate_password(32, false)); ?></code>
                         </p>
                     </td>
                 </tr>
@@ -361,13 +473,13 @@ function wpsm_settings_page() {
             </table>
 
             <h2>REST API Endpoints</h2>
-            <p>The plugin exposes these REST API endpoints (all require the secret key or admin authentication):</p>
+            <p>The plugin exposes these REST API endpoints (all require the <code>X-WPSM-Key</code> header or admin authentication):</p>
             <table class="widefat" style="max-width:800px;">
                 <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
                 <tbody>
-                    <tr><td><code>GET</code></td><td><code>/wp-json/wpsm/v1/stats?key=YOUR_KEY</code></td><td>Bot & error statistics (24h, 7d)</td></tr>
-                    <tr><td><code>GET</code></td><td><code>/wp-json/wpsm/v1/unvisited?key=YOUR_KEY&limit=200&bot=Googlebot</code></td><td>Unvisited posts (for indexing script)</td></tr>
-                    <tr><td><code>POST</code></td><td><code>/wp-json/wpsm/v1/log-push?key=YOUR_KEY</code></td><td>Log indexing push results (JSON array body)</td></tr>
+                    <tr><td><code>GET</code></td><td><code>/wp-json/wpsm/v1/stats</code></td><td>Bot & error statistics (24h, 7d)</td></tr>
+                    <tr><td><code>GET</code></td><td><code>/wp-json/wpsm/v1/unvisited?limit=200&amp;bot=Googlebot</code></td><td>Unvisited posts (for indexing script)</td></tr>
+                    <tr><td><code>POST</code></td><td><code>/wp-json/wpsm/v1/log-push</code></td><td>Log indexing push results (JSON array body)</td></tr>
                 </tbody>
             </table>
 
@@ -404,7 +516,24 @@ function wpsm_dashboard_page() {
     echo '</nav>';
 
     // Copy-to-clipboard inline script
-    echo '<script>function wpsmCopy(t){navigator.clipboard.writeText(t).then(function(){},function(){var a=document.createElement("textarea");a.value=t;document.body.appendChild(a);a.select();document.execCommand("copy");document.body.removeChild(a);});}</script>';
+    echo '<script>
+    document.addEventListener("click", function(event) {
+        var target = event.target.closest(".wpsm-copy");
+        if (!target) {
+            return;
+        }
+
+        var text = target.getAttribute("data-copy") || "";
+        navigator.clipboard.writeText(text).catch(function() {
+            var textarea = document.createElement("textarea");
+            textarea.value = text;
+            document.body.appendChild(textarea);
+            textarea.select();
+            document.execCommand("copy");
+            document.body.removeChild(textarea);
+        });
+    });
+    </script>';
     echo '<style>.wpsm-copy{cursor:pointer;opacity:0.5;margin-left:4px;vertical-align:middle;}.wpsm-copy:hover{opacity:1;}</style>';
 
     echo '<div style="margin-top:20px;">';
@@ -425,13 +554,13 @@ function wpsm_dashboard_page() {
 function wpsm_tab_overview() {
     global $wpdb;
     $prefix = $wpdb->prefix;
-    $yesterday = date('Y-m-d H:i:s', strtotime('-24 hours'));
-    $week_ago = date('Y-m-d H:i:s', strtotime('-7 days'));
+    $yesterday = wpsm_get_request_timestamp('-24 hours');
+    $week_ago = wpsm_get_request_timestamp('-7 days');
 
-    $bot_24h = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$prefix}wpsm_bot_log WHERE visit_time >= '$yesterday'");
-    $bot_7d = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$prefix}wpsm_bot_log WHERE visit_time >= '$week_ago'");
-    $errors_24h = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$prefix}wpsm_error_log WHERE error_time >= '$yesterday'");
-    $errors_7d = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$prefix}wpsm_error_log WHERE error_time >= '$week_ago'");
+    $bot_24h = (int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$prefix}wpsm_bot_log WHERE visit_time >= %s", $yesterday));
+    $bot_7d = (int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$prefix}wpsm_bot_log WHERE visit_time >= %s", $week_ago));
+    $errors_24h = (int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$prefix}wpsm_error_log WHERE error_time >= %s", $yesterday));
+    $errors_7d = (int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$prefix}wpsm_error_log WHERE error_time >= %s", $week_ago));
     $total_posts = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_status='publish' AND post_type='post'");
     $crawled_posts = (int)$wpdb->get_var("SELECT COUNT(DISTINCT post_id) FROM {$prefix}wpsm_post_stats WHERE bot LIKE 'Google%'");
     $uncrawled = $total_posts - $crawled_posts;
@@ -456,7 +585,7 @@ function wpsm_tab_overview() {
 
     // Bot activity by type (24h)
     echo '<h2>Bot activity (last 24h)</h2>';
-    $bot_stats = $wpdb->get_results("SELECT bot, COUNT(*) as cnt FROM {$prefix}wpsm_bot_log WHERE visit_time >= '$yesterday' GROUP BY bot ORDER BY cnt DESC");
+    $bot_stats = $wpdb->get_results($wpdb->prepare("SELECT bot, COUNT(*) as cnt FROM {$prefix}wpsm_bot_log WHERE visit_time >= %s GROUP BY bot ORDER BY cnt DESC", $yesterday));
     if ($bot_stats) {
         echo '<table class="widefat striped"><thead><tr><th>Bot</th><th>Visits</th><th>Share</th></tr></thead><tbody>';
         $total = array_sum(array_column($bot_stats, 'cnt'));
@@ -479,8 +608,7 @@ function wpsm_tab_overview() {
         echo '<table class="widefat striped"><thead><tr><th>URL</th><th>Hits</th><th>Bots</th><th>Last seen</th></tr></thead><tbody>';
         foreach ($errors as $e) {
             $url_short = strlen($e->url) > 60 ? substr($e->url, 0, 60) . '...' : $e->url;
-            $url_escaped = esc_attr($e->url);
-            $copy_btn = '<span class="wpsm-copy dashicons dashicons-clipboard" title="Copy full URL" onclick="wpsmCopy(\'' . $url_escaped . '\')"></span>';
+            $copy_btn = '<span class="wpsm-copy dashicons dashicons-clipboard" title="Copy full URL" data-copy="' . esc_attr($e->url) . '"></span>';
             $bot_badge = $e->bot_hits > 0 ? '<span style="background:#d63638;color:#fff;padding:1px 6px;border-radius:3px;font-size:11px;">' . $e->bot_hits . ' bot</span>' : '';
             echo "<tr><td><code>" . esc_html($url_short) . "</code>{$copy_btn}</td><td>{$e->cnt}</td><td>{$bot_badge}</td><td>{$e->last_seen}</td></tr>";
         }
@@ -548,8 +676,7 @@ function wpsm_tab_errors() {
         echo '<table class="widefat striped"><thead><tr><th>URL</th><th>Hits</th><th>Bots</th><th>Bot names</th><th>Last seen</th></tr></thead><tbody>';
         foreach ($grouped as $g) {
             $url_short = strlen($g->url) > 60 ? substr($g->url, 0, 60) . '...' : $g->url;
-            $url_escaped = esc_attr($g->url);
-            $copy_btn = '<span class="wpsm-copy dashicons dashicons-clipboard" title="Copy full URL" onclick="wpsmCopy(\'' . $url_escaped . '\')"></span>';
+            $copy_btn = '<span class="wpsm-copy dashicons dashicons-clipboard" title="Copy full URL" data-copy="' . esc_attr($g->url) . '"></span>';
             $bots = $g->bots ? '<span style="font-size:11px;color:#d63638;">' . esc_html($g->bots) . '</span>' : '-';
             echo "<tr><td><code>" . esc_html($url_short) . "</code>{$copy_btn}</td><td><strong>{$g->cnt}</strong></td><td>{$g->bot_hits}</td><td>{$bots}</td><td>{$g->last_seen}</td></tr>";
         }
@@ -567,8 +694,7 @@ function wpsm_tab_errors() {
         echo '<table class="widefat striped"><thead><tr><th>Time</th><th>URL</th><th>Referer</th><th>Bot</th></tr></thead><tbody>';
         foreach ($recent as $e) {
             $url_short = strlen($e->url) > 50 ? substr($e->url, 0, 50) . '...' : $e->url;
-            $url_escaped = esc_attr($e->url);
-            $copy_btn = '<span class="wpsm-copy dashicons dashicons-clipboard" title="Copy full URL" onclick="wpsmCopy(\'' . $url_escaped . '\')"></span>';
+            $copy_btn = '<span class="wpsm-copy dashicons dashicons-clipboard" title="Copy full URL" data-copy="' . esc_attr($e->url) . '"></span>';
             $ref_short = $e->referer ? (strlen($e->referer) > 40 ? substr($e->referer, 0, 40) . '...' : $e->referer) : '-';
             $bot_label = $e->bot_name ?: ($e->is_bot ? 'bot' : 'user');
             $bot_style = $e->is_bot ? 'color:#d63638;font-weight:600;' : 'color:#8c8f94;';
@@ -696,18 +822,22 @@ function wpsm_tab_indexing() {
         wpsm_create_tables();
     }
 
-    $today = date('Y-m-d');
-    $month_start = date('Y-m-01');
+    $today = gmdate('Y-m-d', current_time('timestamp', true));
+    $month_start = gmdate('Y-m-01', current_time('timestamp', true));
     $page_num = max(1, intval($_GET['paged'] ?? 1));
     $per_page = 50;
     $offset = ($page_num - 1) * $per_page;
-    $filter_month = isset($_GET['month']) ? sanitize_text_field($_GET['month']) : date('Y-m');
+    $filter_month = isset($_GET['month']) ? wpsm_validate_month(sanitize_text_field(wp_unslash($_GET['month']))) : gmdate('Y-m', current_time('timestamp', true));
+    $today_start = $today . ' 00:00:00';
+    $month_start_dt = $month_start . ' 00:00:00';
+    $filter_month_start = $filter_month . '-01';
+    $filter_month_end = gmdate('Y-m-d', strtotime('+1 month', strtotime($filter_month_start)));
 
-    $sent_today = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$prefix}wpsm_indexing_log WHERE push_time >= '$today 00:00:00'");
-    $ok_today = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$prefix}wpsm_indexing_log WHERE push_time >= '$today 00:00:00' AND status='ok'");
-    $err_today = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$prefix}wpsm_indexing_log WHERE push_time >= '$today 00:00:00' AND status='error'");
-    $sent_month = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$prefix}wpsm_indexing_log WHERE push_time >= '$month_start 00:00:00'");
-    $ok_month = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$prefix}wpsm_indexing_log WHERE push_time >= '$month_start 00:00:00' AND status='ok'");
+    $sent_today = (int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$prefix}wpsm_indexing_log WHERE push_time >= %s", $today_start));
+    $ok_today = (int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$prefix}wpsm_indexing_log WHERE push_time >= %s AND status = %s", $today_start, 'ok'));
+    $err_today = (int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$prefix}wpsm_indexing_log WHERE push_time >= %s AND status = %s", $today_start, 'error'));
+    $sent_month = (int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$prefix}wpsm_indexing_log WHERE push_time >= %s", $month_start_dt));
+    $ok_month = (int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$prefix}wpsm_indexing_log WHERE push_time >= %s AND status = %s", $month_start_dt, 'ok'));
     $total_ever = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$prefix}wpsm_indexing_log");
     $unique_posts = (int)$wpdb->get_var("SELECT COUNT(DISTINCT post_id) FROM {$prefix}wpsm_indexing_log WHERE status='ok'");
 
@@ -742,13 +872,13 @@ function wpsm_tab_indexing() {
         echo '</div>';
     }
 
-    $daily = $wpdb->get_results("SELECT DATE(push_time) as day,
+    $daily = $wpdb->get_results($wpdb->prepare("SELECT DATE(push_time) as day,
         COUNT(*) as total,
         SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) as ok_cnt,
         SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) as err_cnt
         FROM {$prefix}wpsm_indexing_log
-        WHERE push_time >= '{$filter_month}-01' AND push_time < DATE_ADD('{$filter_month}-01', INTERVAL 1 MONTH)
-        GROUP BY DATE(push_time) ORDER BY day DESC");
+        WHERE push_time >= %s AND push_time < %s
+        GROUP BY DATE(push_time) ORDER BY day DESC", $filter_month_start, $filter_month_end));
 
     if ($daily) {
         echo '<table class="widefat striped"><thead><tr><th>Date</th><th>Sent</th><th>OK</th><th>Errors</th><th>Chart</th></tr></thead><tbody>';
@@ -813,12 +943,19 @@ function wpsm_pagination($total, $per_page, $current_page, $tab, $extra_params =
 
 add_action('rest_api_init', function() {
     $auth_check = function($request) {
-        $secret = wpsm_get_secret_key();
-        if (!empty($secret)) {
-            $key = $request->get_param('key');
-            if ($key === $secret) return true;
+        $header_key = sanitize_text_field((string) $request->get_header('x-wpsm-key'));
+        if ($header_key === '') {
+            $header_key = wpsm_get_request_header('X-WPSM-Key');
         }
-        return current_user_can('manage_options');
+        if (wpsm_verify_secret_key($header_key)) {
+            return true;
+        }
+
+        if (current_user_can('manage_options')) {
+            return true;
+        }
+
+        return new WP_Error('rest_forbidden', 'Unauthorized request.', array('status' => 401));
     };
 
     // Stats endpoint
@@ -827,15 +964,15 @@ add_action('rest_api_init', function() {
         'callback' => function($request) {
             global $wpdb;
             $prefix = $wpdb->prefix;
-            $yesterday = date('Y-m-d H:i:s', strtotime('-24 hours'));
-            $week_ago = date('Y-m-d H:i:s', strtotime('-7 days'));
+            $yesterday = wpsm_get_request_timestamp('-24 hours');
+            $week_ago = wpsm_get_request_timestamp('-7 days');
 
             return rest_ensure_response(array(
-                'bots_24h' => (int)$wpdb->get_var("SELECT COUNT(*) FROM {$prefix}wpsm_bot_log WHERE visit_time >= '$yesterday'"),
-                'bots_7d' => (int)$wpdb->get_var("SELECT COUNT(*) FROM {$prefix}wpsm_bot_log WHERE visit_time >= '$week_ago'"),
-                'errors_24h' => (int)$wpdb->get_var("SELECT COUNT(*) FROM {$prefix}wpsm_error_log WHERE error_time >= '$yesterday'"),
-                'errors_7d' => (int)$wpdb->get_var("SELECT COUNT(*) FROM {$prefix}wpsm_error_log WHERE error_time >= '$week_ago'"),
-                'bot_breakdown_24h' => $wpdb->get_results("SELECT bot, COUNT(*) as cnt FROM {$prefix}wpsm_bot_log WHERE visit_time >= '$yesterday' GROUP BY bot ORDER BY cnt DESC"),
+                'bots_24h' => (int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$prefix}wpsm_bot_log WHERE visit_time >= %s", $yesterday)),
+                'bots_7d' => (int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$prefix}wpsm_bot_log WHERE visit_time >= %s", $week_ago)),
+                'errors_24h' => (int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$prefix}wpsm_error_log WHERE error_time >= %s", $yesterday)),
+                'errors_7d' => (int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$prefix}wpsm_error_log WHERE error_time >= %s", $week_ago)),
+                'bot_breakdown_24h' => $wpdb->get_results($wpdb->prepare("SELECT bot, COUNT(*) as cnt FROM {$prefix}wpsm_bot_log WHERE visit_time >= %s GROUP BY bot ORDER BY cnt DESC", $yesterday)),
                 'top_errors' => $wpdb->get_results("SELECT url, COUNT(*) as cnt, MAX(error_time) as last_seen FROM {$prefix}wpsm_error_log GROUP BY url ORDER BY cnt DESC LIMIT 20"),
             ));
         },
@@ -900,32 +1037,33 @@ add_action('rest_api_init', function() {
             if (!is_array($items) || empty($items)) {
                 return new WP_Error('invalid_data', 'Expected JSON array of push results', array('status' => 400));
             }
+            if (count($items) > 500) {
+                return new WP_Error('too_many_items', 'Payload too large.', array('status' => 400));
+            }
 
             $inserted = 0;
             foreach ($items as $item) {
-                if (empty($item['post_id']) || empty($item['url'])) continue;
+                if (!is_array($item) || empty($item['post_id']) || empty($item['url'])) continue;
+
+                $status = sanitize_key($item['status'] ?? 'sent');
+                if (!in_array($status, array('sent', 'ok', 'error'), true)) {
+                    $status = 'sent';
+                }
+
+                $url = esc_url_raw($item['url']);
+                if ($url === '') {
+                    continue;
+                }
+
                 $wpdb->insert($wpdb->prefix . 'wpsm_indexing_log', array(
                     'push_time' => current_time('mysql'),
                     'post_id' => intval($item['post_id']),
-                    'url' => substr($item['url'], 0, 500),
-                    'status' => sanitize_text_field($item['status'] ?? 'sent'),
+                    'url' => substr($url, 0, 500),
+                    'status' => $status,
                     'response_code' => intval($item['response_code'] ?? 0),
-                    'response_body' => substr($item['response_body'] ?? '', 0, 1000),
+                    'response_body' => substr(sanitize_textarea_field($item['response_body'] ?? ''), 0, 1000),
                 ));
                 $inserted++;
-            }
-
-            // Cleanup
-            $limit = (int) get_option('wpsm_indexing_log_limit', 50000);
-            $threshold = (int) ($limit * 1.1);
-            $count = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}wpsm_indexing_log");
-            if ($count > $threshold) {
-                $cutoff_id = $wpdb->get_var($wpdb->prepare(
-                    "SELECT id FROM {$wpdb->prefix}wpsm_indexing_log ORDER BY id DESC LIMIT 1 OFFSET %d", $limit
-                ));
-                if ($cutoff_id) {
-                    $wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->prefix}wpsm_indexing_log WHERE id < %d", $cutoff_id));
-                }
             }
 
             return rest_ensure_response(array('logged' => $inserted));
@@ -1042,9 +1180,15 @@ function wpsm_handle_export_xlsx() {
 }
 
 function wpsm_generate_xlsx($sheets) {
+    if (!class_exists('ZipArchive')) {
+        wp_die('ZipArchive extension is required for XLSX export.');
+    }
+
     $tmp = tempnam(sys_get_temp_dir(), 'wpsm');
     $zip = new ZipArchive();
-    $zip->open($tmp, ZipArchive::CREATE | ZipArchive::OVERWRITE);
+    if (true !== $zip->open($tmp, ZipArchive::CREATE | ZipArchive::OVERWRITE)) {
+        wp_die('Unable to create XLSX export.');
+    }
 
     // [Content_Types].xml
     $ct = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
