@@ -754,7 +754,13 @@ function wpsm_tab_indexing() {
     }
 
     $start_month = $filter_month . '-01';
-    $next_month = date('Y-m-d', strtotime($start_month . ' +1 month'));
+    $start_date = DateTimeImmutable::createFromFormat('Y-m-d', $start_month);
+    if ($start_date instanceof DateTimeImmutable) {
+        $next_month = $start_date->modify('+1 month')->format('Y-m-d');
+    } else {
+        // Fallback: use the same day as both bounds to avoid broadening the query range
+        $next_month = $start_month;
+    }
     $daily = $wpdb->get_results($wpdb->prepare(
         "SELECT DATE(push_time) as day,
         COUNT(*) as total,
