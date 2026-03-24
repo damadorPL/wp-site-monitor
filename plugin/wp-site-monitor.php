@@ -748,7 +748,7 @@ function wpsm_tab_indexing() {
         echo '<div style="margin-bottom:15px;">';
         foreach ($available_months as $m) {
             $active = ($filter_month === $m) ? 'button-primary' : '';
-            echo '<a href="?page=' . WPSM_SLUG . '&tab=indexing&month=' . urlencode($m) . '" class="button ' . $active . '">' . esc_html($m) . '</a> ';
+            echo '<a href="' . esc_url('?page=' . WPSM_SLUG . '&tab=indexing&month=' . urlencode($m)) . '" class="button ' . $active . '">' . esc_html($m) . '</a> ';
         }
         echo '</div>';
     }
