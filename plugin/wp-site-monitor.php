@@ -702,7 +702,14 @@ function wpsm_tab_indexing() {
     $per_page = 50;
     $offset = ($page_num - 1) * $per_page;
     $filter_month_raw = isset($_GET['month']) ? sanitize_text_field($_GET['month']) : date('Y-m');
-    $filter_month = preg_match('/^\d{4}-\d{2}$/', $filter_month_raw) ? $filter_month_raw : date('Y-m');
+    $filter_month = date('Y-m');
+    if ($filter_month_raw) {
+        $dt = DateTime::createFromFormat('Y-m', $filter_month_raw);
+        $errors = DateTime::getLastErrors();
+        if ($dt && $errors['warning_count'] === 0 && $errors['error_count'] === 0 && $dt->format('Y-m') === $filter_month_raw) {
+            $filter_month = $filter_month_raw;
+        }
+    }
 
     $sent_today = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$prefix}wpsm_indexing_log WHERE push_time >= '$today 00:00:00'");
     $ok_today = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$prefix}wpsm_indexing_log WHERE push_time >= '$today 00:00:00' AND status='ok'");
