@@ -701,7 +701,15 @@ function wpsm_tab_indexing() {
     $page_num = max(1, intval($_GET['paged'] ?? 1));
     $per_page = 50;
     $offset = ($page_num - 1) * $per_page;
-    $filter_month = isset($_GET['month']) ? sanitize_text_field($_GET['month']) : date('Y-m');
+    $filter_month_raw = isset($_GET['month']) ? sanitize_text_field($_GET['month']) : date('Y-m');
+    $filter_month = date('Y-m');
+    if ($filter_month_raw) {
+        $dt = DateTime::createFromFormat('Y-m', $filter_month_raw);
+        $errors = DateTime::getLastErrors();
+        if ($dt && $errors['warning_count'] === 0 && $errors['error_count'] === 0 && $dt->format('Y-m') === $filter_month_raw) {
+            $filter_month = $filter_month_raw;
+        }
+    }
 
     $sent_today = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$prefix}wpsm_indexing_log WHERE push_time >= '$today 00:00:00'");
     $ok_today = (int)$wpdb->get_var("SELECT COUNT(*) FROM {$prefix}wpsm_indexing_log WHERE push_time >= '$today 00:00:00' AND status='ok'");
@@ -731,24 +739,39 @@ function wpsm_tab_indexing() {
 
     // Daily breakdown
     $available_months = $wpdb->get_col("SELECT DISTINCT DATE_FORMAT(push_time, '%Y-%m') as m FROM {$prefix}wpsm_indexing_log ORDER BY m DESC LIMIT 12");
+    if ($available_months && !in_array($filter_month, $available_months, true)) {
+        $filter_month = $available_months[0];
+    }
 
     echo '<h2>Daily summary</h2>';
     if ($available_months) {
         echo '<div style="margin-bottom:15px;">';
         foreach ($available_months as $m) {
             $active = ($filter_month === $m) ? 'button-primary' : '';
-            echo '<a href="?page=' . WPSM_SLUG . '&tab=indexing&month=' . $m . '" class="button ' . $active . '">' . $m . '</a> ';
+            echo '<a href="' . esc_url('?page=' . WPSM_SLUG . '&tab=indexing&month=' . urlencode($m)) . '" class="button ' . $active . '">' . esc_html($m) . '</a> ';
         }
         echo '</div>';
     }
 
-    $daily = $wpdb->get_results("SELECT DATE(push_time) as day,
+    $start_month = $filter_month . '-01';
+    $start_date = DateTimeImmutable::createFromFormat('Y-m-d', $start_month);
+    if ($start_date instanceof DateTimeImmutable) {
+        $next_month = $start_date->modify('+1 month')->format('Y-m-d');
+    } else {
+        // Fallback: use the same day as both bounds to avoid broadening the query range
+        $next_month = $start_month;
+    }
+    $daily = $wpdb->get_results($wpdb->prepare(
+        "SELECT DATE(push_time) as day,
         COUNT(*) as total,
         SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) as ok_cnt,
         SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) as err_cnt
         FROM {$prefix}wpsm_indexing_log
-        WHERE push_time >= '{$filter_month}-01' AND push_time < DATE_ADD('{$filter_month}-01', INTERVAL 1 MONTH)
-        GROUP BY DATE(push_time) ORDER BY day DESC");
+        WHERE push_time >= %s AND push_time < %s
+        GROUP BY DATE(push_time) ORDER BY day DESC",
+        $start_month,
+        $next_month
+    ));
 
     if ($daily) {
         echo '<table class="widefat striped"><thead><tr><th>Date</th><th>Sent</th><th>OK</th><th>Errors</th><th>Chart</th></tr></thead><tbody>';
